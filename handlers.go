@@ -3956,6 +3956,14 @@ func (s *Server) handleShuttleConnection(c echo.Context) error {
 	return nil
 }
 
+// handleAutoretrieveInit godoc
+// @Summary      Register autoretrieve server
+// @Description  This endpoint registers a new autoretrieve server
+// @Tags         autoretrieve
+// @Param        addresses body []string true "Autoretrieve's address list"
+// @Param        privateKey body string true "Autoretrieve's private key"
+// @Produce      json
+// @Router       /admin/autoretrieve/init [post]
 func (s *Server) handleAutoretrieveInit(c echo.Context) error {
 	// validate peerid and peer multi addresses
 	addresses := strings.Split(c.FormValue("addresses"), ",")
@@ -3983,6 +3991,12 @@ func (s *Server) handleAutoretrieveInit(c echo.Context) error {
 	})
 }
 
+// handleAutoretrieveList godoc
+// @Summary      List autoretrieve servers
+// @Description  This endpoint lists all registered autoretrieve servers
+// @Tags         autoretrieve
+// @Produce      json
+// @Router       /admin/autoretrieve/list [get]
 func (s *Server) handleAutoretrieveList(c echo.Context) error {
 	var autoretrieves []Autoretrieve
 	if err := s.DB.Find(&autoretrieves).Error; err != nil {
@@ -4010,6 +4024,13 @@ func (s *Server) handleAutoretrieveList(c echo.Context) error {
 	return c.JSON(200, out)
 }
 
+// handleAutoretrieveHeartbeat godoc
+// @Summary      Marks autoretrieve server as up
+// @Description  This endpoint updates the lastConnection field for autoretrieve
+// @Tags         autoretrieve
+// @Param        token header string true "Autoretrieve's auth token"
+// @Produce      json
+// @Router       /autoretrieve/list [post]
 func (s *Server) handleAutoretrieveHeartbeat(c echo.Context) error {
 	auth, err := util.ExtractAuth(c)
 	if err != nil {
