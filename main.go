@@ -22,12 +22,19 @@ import (
 	"github.com/application-research/estuary/util"
 	"github.com/application-research/estuary/util/gateway"
 	"github.com/application-research/filclient"
+	provider "github.com/filecoin-project/index-provider"
+	"github.com/filecoin-project/index-provider/engine/chunker"
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
+	"github.com/ipfs/go-datastore"
 	gsimpl "github.com/ipfs/go-graphsync/impl"
 	logging "github.com/ipfs/go-log/v2"
+	"github.com/ipld/go-car/v2/index"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	routed "github.com/libp2p/go-libp2p/p2p/host/routed"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/whyrusleeping/memo"
@@ -147,6 +154,7 @@ func multiAddrsToString(addrs []multiaddr.Multiaddr) []string {
 	return rAddrs
 }
 
+// TODO: move to util
 func stringToMultiAddrs(addrStr string) ([]multiaddr.Multiaddr, error) {
 	var mAddrs []multiaddr.Multiaddr
 	for _, addr := range strings.Split(addrStr, ",") {
@@ -159,6 +167,82 @@ func stringToMultiAddrs(addrStr string) ([]multiaddr.Multiaddr, error) {
 	return mAddrs, nil
 }
 
+// Shamelessly stolen from https://github.com/filecoin-project/index-provider/blob/c6a250f10cacb9798675ded763f6dea722ba3734/engine/chunker/cached_chunker_test.go#L322-L336
+func getMhIterator(contents []Content) (provider.MultihashIterator, error) {
+	idx := index.NewMultihashSorted()
+	var records []index.Record
+	for i, content := range contents {
+		records = append(records, index.Record{
+			Cid:    content.Cid.CID,
+			Offset: uint64(i + 1),
+		})
+	}
+	err := idx.Load(records)
+	if err != nil {
+		return nil, err
+	}
+	iterator, err := provider.CarMultihashIterator(idx)
+	if err != nil {
+		return nil, err
+	}
+	return iterator, nil
+}
+
+func buildAdvertisement(h host.Host, newContents []Content, contextID []byte) (schema.Advertisement, error) {
+	// TODO: maybe add metadata here? currently empty
+	md := metadata.New(metadata.Bitswap{})
+	mdBytes, err := md.MarshalBinary()
+	if err != nil {
+		return schema.Advertisement{}, err
+	}
+
+	//TODO: these values are completely arbitrary
+	chunkSize := 1000
+	capacity := 1000
+	entriesChuncker, err := chunker.NewCachedEntriesChunker(context.Background(), datastore.NewMapDatastore(), chunkSize, capacity)
+	if err != nil {
+		return schema.Advertisement{}, err
+	}
+
+	mhIterator, err := getMhIterator(newContents)
+	if err != nil {
+		return schema.Advertisement{}, err
+	}
+
+	entries, err := entriesChuncker.Chunk(context.Background(), mhIterator)
+	if err != nil {
+		return schema.Advertisement{}, err
+	}
+
+	ad := schema.Advertisement{
+		Provider:  h.ID().String(),
+		Addresses: multiAddrsToString(h.Addrs()),
+		Entries:   entries,
+		ContextID: contextID,
+		Metadata:  mdBytes,
+	}
+
+	return ad, nil
+}
+
+// createFakeAutoretrieveHost builds a libp2p host object with the
+// private key of the autoretrieve server so we can send advertisements
+// on behalf of those servers (as if we were them)
+// Note: this is a hack, we should create tokens that give partial
+// permissions to other players
+func createFakeAutoretrieveHost(ar Autoretrieve) (host.Host, error) {
+	arPrivKey, err := stringToPrivkey(ar.PrivateKey)
+	if err != nil {
+		return nil, err
+	}
+
+	h, err := libp2p.New(libp2p.Identity(arPrivKey))
+	if err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
 // announceNewCIDs publishes an announcement with the CIDs that were added
 // between now and lastTickTime (see updateAutoretrieveIndex)
 func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
@@ -166,23 +250,32 @@ func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 		return fmt.Errorf("no new CIDs to announce")
 	}
 
-	arPrivKey, err := stringToPrivkey(ar.PrivateKey)
+	// create new host to pretend to be the autoretrieve server publishing the announcement
+	h, err := createFakeAutoretrieveHost(ar)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
-	// create new host to pretend to be the autoretrieve server publishing the announcement
 	addrs, err := stringToMultiAddrs(ar.Addresses)
 	if err != nil {
-		log.Fatal(err)
-	}
-	// h, err := libp2p.New(libp2p.Identity(arPrivKey), libp2p.ListenAddrs(addrs...))
-	h, err := libp2p.New(libp2p.Identity(arPrivKey))
-	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
+	// For local testing (specify pubsub on localhost)
+	topic := "testingTopic"
+
+	subHost, err := libp2p.New()
+	pubHost, err := libp2p.New()
+	pubG, _ := pubsub.NewGossipSub(context.Background(), pubHost,
+		pubsub.WithDirectConnectTicks(1),
+		pubsub.WithDirectPeers([]peer.AddrInfo{subHost.Peerstore().PeerInfo(subHost.ID())}),
+	)
+	pubT, err := pubG.Join(topic)
+
 	e, err := engine.New(
+		engine.WithHost(pubHost),    // TODO: remove, testing
+		engine.WithTopic(pubT),      // TODO: remove, testing
+		engine.WithTopicName(topic), // TODO: remove, testing
 		engine.WithHost(h),
 		engine.WithPublisherKind(engine.DataTransferPublisher),
 		// we need these addresses to be here instead
@@ -196,28 +289,21 @@ func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 
 	e.Start(context.Background())
 	defer e.Shutdown()
-	ctxID := []byte("main") // TODO: what should this be?
 
-	// TODO: maybe add metadata here? currently empty
-	md := metadata.New(metadata.Bitswap{})
-	mdBytes, err := md.MarshalBinary()
+	// build contextID for advertisement (format: EstuaryAd-1, EstuaryAd-2, ...)
+	strAdIdx := strconv.Itoa(s.IdxCtxID)
+	contextID := []byte("EstuaryAd-" + strAdIdx)
+
+	ad, err := buildAdvertisement(h, newContents, contextID)
 	if err != nil {
 		return err
-	}
-
-	ad := schema.Advertisement{
-		Provider:  h.ID().String(),
-		Addresses: multiAddrsToString(h.Addrs()),
-		Entries:   schema.NoEntries, //TODO: this should have our CIDs
-		ContextID: ctxID,
-		Metadata:  mdBytes,
 	}
 
 	adCID, err := e.Publish(context.Background(), ad)
 	if err != nil {
 		return err
 	}
-	log.Info("Published advertisement: %+v\n", adCID)
+	log.Infof("Published advertisement: %+v", adCID)
 
 	return nil
 }
@@ -511,6 +597,7 @@ func main() {
 			tracer:      otel.Tracer("api"),
 			cacher:      memo.NewCacher(),
 			gwayHandler: gateway.NewGatewayHandler(nd.Blockstore),
+			IdxCtxID:    0,
 		}
 
 		// TODO: this is an ugly self referential hack... should fix
@@ -613,7 +700,7 @@ func main() {
 		}
 
 		stopUpdateIndex := make(chan struct{})
-		go s.updateAutoretrieveIndex(time.Duration(intervalMinutes)*time.Minute, stopUpdateIndex)
+		go s.updateAutoretrieveIndex(time.Duration(intervalMinutes)*time.Second, stopUpdateIndex) //TODO: minute
 
 		go func() {
 			time.Sleep(time.Second * 10)
@@ -708,6 +795,7 @@ type Server struct {
 	Api        api.Gateway
 	CM         *ContentManager
 	StagingMgr *stagingbs.StagingBSMgr
+	IdxCtxID   int
 
 	gwayHandler *gateway.GatewayHandler
 
