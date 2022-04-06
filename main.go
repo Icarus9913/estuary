@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -33,10 +34,9 @@ import (
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
-	"github.com/libp2p/go-libp2p-core/peer"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	routed "github.com/libp2p/go-libp2p/p2p/host/routed"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/multiformats/go-multihash"
 	"github.com/whyrusleeping/memo"
 	"go.opentelemetry.io/otel"
 
@@ -261,21 +261,7 @@ func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 		return err
 	}
 
-	// For local testing (specify pubsub on localhost)
-	topic := "testingTopic"
-
-	subHost, err := libp2p.New()
-	pubHost, err := libp2p.New()
-	pubG, _ := pubsub.NewGossipSub(context.Background(), pubHost,
-		pubsub.WithDirectConnectTicks(1),
-		pubsub.WithDirectPeers([]peer.AddrInfo{subHost.Peerstore().PeerInfo(subHost.ID())}),
-	)
-	pubT, err := pubG.Join(topic)
-
 	e, err := engine.New(
-		engine.WithHost(pubHost),    // TODO: remove, testing
-		engine.WithTopic(pubT),      // TODO: remove, testing
-		engine.WithTopicName(topic), // TODO: remove, testing
 		engine.WithHost(h),
 		engine.WithPublisherKind(engine.DataTransferPublisher),
 		// we need these addresses to be here instead
@@ -290,22 +276,44 @@ func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 	e.Start(context.Background())
 	defer e.Shutdown()
 
+	e.RegisterMultihashLister(func(ctx context.Context, contextID []byte) (provider.MultihashIterator, error) {
+		var multiHashes []multihash.Multihash
+		for _, content := range newContents {
+			multiHashes = append(multiHashes, content.Cid.CID.Hash())
+		}
+
+		return &estuaryMhIterator{
+			offset: 0,
+			mh:     multiHashes,
+		}, nil
+	})
+
 	// build contextID for advertisement (format: EstuaryAd-1, EstuaryAd-2, ...)
 	strAdIdx := strconv.Itoa(s.IdxCtxID)
 	contextID := []byte("EstuaryAd-" + strAdIdx)
 
-	ad, err := buildAdvertisement(h, newContents, contextID)
+	adCid, err := e.NotifyPut(context.Background(), []byte(contextID), metadata.New(metadata.Bitswap{}))
 	if err != nil {
 		return err
 	}
 
-	adCID, err := e.Publish(context.Background(), ad)
-	if err != nil {
-		return err
-	}
-	log.Infof("Published advertisement: %+v", adCID)
+	log.Infof("Published advertisement: %+v", adCid)
 
 	return nil
+}
+
+type estuaryMhIterator struct {
+	offset int
+	mh     []multihash.Multihash
+}
+
+func (m *estuaryMhIterator) Next() (multihash.Multihash, error) {
+	if m.offset < len(m.mh) {
+		hash := m.mh[m.offset]
+		m.offset++
+		return hash, nil
+	}
+	return nil, io.EOF
 }
 
 // updateAutoretrieveIndex ticks every tickInterval and checks for new CIDs added
@@ -338,7 +346,10 @@ func (s *Server) updateAutoretrieveIndex(tickInterval time.Duration, quit chan s
 				log.Infof("announcing %d new CIDs to %d autoretrieve servers", len(newContents), len(autoretrieves))
 				for _, ar := range autoretrieves {
 					// send announcement with new CIDs for each autoretrieve server
-					s.announceNewCIDs(newContents, ar)
+					err = s.announceNewCIDs(newContents, ar)
+					if err != nil {
+						log.Errorf("could not announce new contents: %s", err)
+					}
 					//TODO: remove old CIDs (do we even need that?)
 				}
 			} else {
