@@ -34,6 +34,8 @@ import (
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	routed "github.com/libp2p/go-libp2p/p2p/host/routed"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
@@ -251,23 +253,38 @@ func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 	}
 
 	// create new host to pretend to be the autoretrieve server publishing the announcement
-	h, err := createFakeAutoretrieveHost(ar)
-	if err != nil {
-		return err
-	}
+	// h, err := createFakeAutoretrieveHost(ar)
+	// if err != nil {
+	// 	return err
+	// }
 
-	addrs, err := stringToMultiAddrs(ar.Addresses)
+	// addrs, err := stringToMultiAddrs(ar.Addresses)
+	// if err != nil {
+	// 	return err
+	// }
+
+	topic := "testingTopic"
+	indexerMultiaddr, _ := multiaddr.NewMultiaddr("/ip4/127.0.0.1/tcp/3003")
+	indexerAddrinfo, _ := peer.AddrInfosFromP2pAddrs(indexerMultiaddr)
+	pubG, _ := pubsub.NewGossipSub(context.Background(), s.Node.Host,
+		pubsub.WithDirectConnectTicks(1),
+		pubsub.WithDirectPeers(indexerAddrinfo),
+	)
+	pubT, err := pubG.Join(topic)
 	if err != nil {
 		return err
 	}
 
 	e, err := engine.New(
-		engine.WithHost(h),
+		engine.WithTopic(pubT),      // TODO: remove, testing
+		engine.WithTopicName(topic), // TODO: remove, testing
+		// engine.WithHost(h),
+		engine.WithHost(s.Node.Host),
 		engine.WithPublisherKind(engine.DataTransferPublisher),
 		// we need these addresses to be here instead
 		// of on the p2p host h because if we add them
 		// as ListenAddrs it'll try to start listening locally
-		engine.WithRetrievalAddrs(addrs...),
+		// engine.WithRetrievalAddrs(addrs...),
 	)
 	if err != nil {
 		return err

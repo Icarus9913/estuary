@@ -1,0 +1,54 @@
+
+	// create new host to pretend to be the autoretrieve server publishing the announcement
+	h, err := createFakeAutoretrieveHost(ar)
+	if err != nil {
+		return err
+	}
+
+	addrs, err := stringToMultiAddrs(ar.Addresses)
+	if err != nil {
+		return err
+	}
+
+	// For local testing (specify pubsub on localhost)
+	topic := "testingTopic"
+
+	indexerMultiaddr, _ := ma.NewMultiaddr("/ip4/0.0.0.0/tcp/3001/p2p/12D3KooWCD4L8AEXAcPJg6PwosKU9ZWfC2ZisrrsYBvBgrwSBNXw")
+	indexerAddrinfo, _ := peer.AddrInfosFromP2pAddrs(indexerMultiaddr)
+	pubG, _ := pubsub.NewGossipSub(context.Background(), h,
+		pubsub.WithDirectConnectTicks(1),
+		pubsub.WithDirectPeers(indexerAddrinfo),
+	)
+	pubT, err := pubG.Join(topic)
+
+	e, err := engine.New(
+		engine.WithTopic(pubT),      // TODO: remove, testing
+		engine.WithTopicName(topic), // TODO: remove, testing
+		engine.WithHost(h),
+		engine.WithPublisherKind(engine.DataTransferPublisher),
+		// we need these addresses to be here instead
+		// of on the p2p host h because if we add them
+		// as ListenAddrs it'll try to start listening locally
+		engine.WithRetrievalAddrs(addrs...),
+	)
+	if err != nil {
+		return err
+	}
+
+	e.Start(context.Background())
+	defer e.Shutdown()
+
+	// build contextID for advertisement (format: EstuaryAd-1, EstuaryAd-2, ...)
+	strAdIdx := strconv.Itoa(s.IdxCtxID)
+	contextID := []byte("EstuaryAd-" + strAdIdx)
+
+	ad, err := buildAdvertisement(h, newContents, contextID)
+	if err != nil {
+		return err
+	}
+
+	adCID, err := e.Publish(context.Background(), ad)
+	if err != nil {
+		return err
+	}
+	log.Infof("Published advertisement: %+v", adCID)
