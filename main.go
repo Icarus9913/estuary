@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -263,37 +264,7 @@ func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 	// 	return err
 	// }
 
-	topic := "testingTopic"
-	indexerMultiaddr, _ := multiaddr.NewMultiaddr("/ip4/127.0.0.1/tcp/3003")
-	indexerAddrinfo, _ := peer.AddrInfosFromP2pAddrs(indexerMultiaddr)
-	pubG, _ := pubsub.NewGossipSub(context.Background(), s.Node.Host,
-		pubsub.WithDirectConnectTicks(1),
-		pubsub.WithDirectPeers(indexerAddrinfo),
-	)
-	pubT, err := pubG.Join(topic)
-	if err != nil {
-		return err
-	}
-
-	e, err := engine.New(
-		engine.WithTopic(pubT),      // TODO: remove, testing
-		engine.WithTopicName(topic), // TODO: remove, testing
-		// engine.WithHost(h),
-		engine.WithHost(s.Node.Host),
-		engine.WithPublisherKind(engine.DataTransferPublisher),
-		// we need these addresses to be here instead
-		// of on the p2p host h because if we add them
-		// as ListenAddrs it'll try to start listening locally
-		// engine.WithRetrievalAddrs(addrs...),
-	)
-	if err != nil {
-		return err
-	}
-
-	e.Start(context.Background())
-	defer e.Shutdown()
-
-	e.RegisterMultihashLister(func(ctx context.Context, contextID []byte) (provider.MultihashIterator, error) {
+	s.Node.IndexProvider.RegisterMultihashLister(func(ctx context.Context, contextID []byte) (provider.MultihashIterator, error) {
 		var multiHashes []multihash.Multihash
 		for _, content := range newContents {
 			multiHashes = append(multiHashes, content.Cid.CID.Hash())
@@ -306,10 +277,11 @@ func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 	})
 
 	// build contextID for advertisement (format: EstuaryAd-1, EstuaryAd-2, ...)
+	s.IdxCtxID = rand.Intn(1000000)
 	strAdIdx := strconv.Itoa(s.IdxCtxID)
 	contextID := []byte("EstuaryAd-" + strAdIdx)
 
-	adCid, err := e.NotifyPut(context.Background(), []byte(contextID), metadata.New(metadata.Bitswap{}))
+	adCid, err := s.Node.IndexProvider.NotifyPut(context.Background(), []byte(contextID), metadata.New(metadata.Bitswap{}))
 	if err != nil {
 		return err
 	}
@@ -726,6 +698,39 @@ func main() {
 		if err != nil {
 			return err
 		}
+
+		// Create index-provider engine (s.Node.IndexProvider) to send announcements to
+		// this needs to keep running continuously because storetheindex
+		// will come to fetch for advertisements "when it feels like it"
+		topic := "testingTopic"
+		indexerMultiaddr, _ := multiaddr.NewMultiaddr("/ip4/127.0.0.1/tcp/3003")
+		indexerAddrinfo, _ := peer.AddrInfosFromP2pAddrs(indexerMultiaddr)
+		pubG, _ := pubsub.NewGossipSub(context.Background(), s.Node.Host,
+			pubsub.WithDirectConnectTicks(1),
+			pubsub.WithDirectPeers(indexerAddrinfo),
+		)
+		pubT, err := pubG.Join(topic)
+		if err != nil {
+			return err
+		}
+
+		s.Node.IndexProvider, err = engine.New(
+			engine.WithTopic(pubT),      // TODO: remove, testing
+			engine.WithTopicName(topic), // TODO: remove, testing
+			// engine.WithHost(h),
+			engine.WithHost(s.Node.Host), // need to be localhost/estuary
+			engine.WithPublisherKind(engine.DataTransferPublisher),
+			// we need these addresses to be here instead
+			// of on the p2p host h because if we add them
+			// as ListenAddrs it'll try to start listening locally
+			// engine.WithRetrievalAddrs(addrs...),
+		)
+		if err != nil {
+			return err
+		}
+
+		s.Node.IndexProvider.Start(context.Background())
+		defer s.Node.IndexProvider.Shutdown()
 
 		stopUpdateIndex := make(chan struct{})
 		go s.updateAutoretrieveIndex(time.Duration(intervalMinutes)*time.Second, stopUpdateIndex) //TODO: minute
