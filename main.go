@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,7 +31,6 @@ import (
 	gsimpl "github.com/ipfs/go-graphsync/impl"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ipld/go-car/v2/index"
-	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
@@ -228,36 +226,12 @@ func buildAdvertisement(h host.Host, newContents []Content, contextID []byte) (s
 	return ad, nil
 }
 
-// createFakeAutoretrieveHost builds a libp2p host object with the
-// private key of the autoretrieve server so we can send advertisements
-// on behalf of those servers (as if we were them)
-// Note: this is a hack, we should create tokens that give partial
-// permissions to other players
-func createFakeAutoretrieveHost(ar Autoretrieve) (host.Host, error) {
-	arPrivKey, err := stringToPrivkey(ar.PrivateKey)
-	if err != nil {
-		return nil, err
-	}
-
-	h, err := libp2p.New(libp2p.Identity(arPrivKey))
-	if err != nil {
-		return nil, err
-	}
-	return h, nil
-}
-
 // announceNewCIDs publishes an announcement with the CIDs that were added
 // between now and lastTickTime (see updateAutoretrieveIndex)
 func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 	if len(newContents) == 0 {
 		return fmt.Errorf("no new CIDs to announce")
 	}
-
-	// create new host to pretend to be the autoretrieve server publishing the announcement
-	// h, err := createFakeAutoretrieveHost(ar)
-	// if err != nil {
-	// 	return err
-	// }
 
 	// addrs, err := stringToMultiAddrs(ar.Addresses)
 	// if err != nil {
@@ -276,10 +250,19 @@ func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 		}, nil
 	})
 
-	// build contextID for advertisement (format: EstuaryAd-1, EstuaryAd-2, ...)
-	s.IdxCtxID = rand.Intn(1000000)
-	strAdIdx := strconv.Itoa(s.IdxCtxID)
-	contextID := []byte("EstuaryAd-" + strAdIdx)
+	// build contextID for advertisement
+	// format: "EstuaryAd-" + ID of autoretrieve server
+	arPrivKey, err := stringToPrivkey(ar.PrivateKey)
+	if err != nil {
+		return err
+	}
+
+	arID, err := peer.IDFromPrivateKey(arPrivKey)
+	if err != nil {
+		return err
+	}
+	strArID := arID.String()
+	contextID := []byte("EstuaryAd-" + strArID)
 
 	adCid, err := s.Node.IndexProvider.NotifyPut(context.Background(), []byte(contextID), metadata.New(metadata.Bitswap{}))
 	if err != nil {
@@ -303,6 +286,49 @@ func (m *estuaryMhIterator) Next() (multihash.Multihash, error) {
 		return hash, nil
 	}
 	return nil, io.EOF
+}
+
+// newIndexProvider creates a new index-provider engine to send announcements to storetheindex
+// this needs to keep running continuously because storetheindex
+// will come to fetch advertisements "when it feels like it"
+func (s *Server) newIndexProvider() (*engine.Engine, error) {
+	// TODO: remove s *Server, remove topic/indexerMultiaddr, etc.
+	topic := "/indexer/ingest/mainnet"
+	indexerMultiaddr, err := multiaddr.NewMultiaddr("/ip4/127.0.0.1/tcp/3003/p2p/12D3KooWCD4L8AEXAcPJg6PwosKU9ZWfC2ZisrrsYBvBgrwSBNXw")
+	if err != nil {
+		return nil, err
+	}
+	indexerAddrinfo, err := peer.AddrInfosFromP2pAddrs(indexerMultiaddr)
+	if err != nil {
+		return nil, err
+	}
+	pubG, err := pubsub.NewGossipSub(context.Background(), s.Node.Host,
+		pubsub.WithDirectConnectTicks(1),
+		pubsub.WithDirectPeers(indexerAddrinfo),
+	)
+	if err != nil {
+		return nil, err
+	}
+	pubT, err := pubG.Join(topic)
+	if err != nil {
+		return nil, err
+	}
+
+	newEngine, err := engine.New(
+		engine.WithTopic(pubT),      // TODO: remove, testing
+		engine.WithTopicName(topic), // TODO: remove, testing
+		// engine.WithHost(h),
+		engine.WithHost(s.Node.Host), // need to be localhost/estuary
+		engine.WithPublisherKind(engine.DataTransferPublisher),
+		// we need these addresses to be here instead
+		// of on the p2p host h because if we add them
+		// as ListenAddrs it'll try to start listening locally
+		// engine.WithRetrievalAddrs(addrs...),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return newEngine, nil
 }
 
 // updateAutoretrieveIndex ticks every tickInterval and checks for new CIDs added
@@ -702,33 +728,10 @@ func main() {
 		// Create index-provider engine (s.Node.IndexProvider) to send announcements to
 		// this needs to keep running continuously because storetheindex
 		// will come to fetch for advertisements "when it feels like it"
-		topic := "testingTopic"
-		indexerMultiaddr, _ := multiaddr.NewMultiaddr("/ip4/127.0.0.1/tcp/3003")
-		indexerAddrinfo, _ := peer.AddrInfosFromP2pAddrs(indexerMultiaddr)
-		pubG, _ := pubsub.NewGossipSub(context.Background(), s.Node.Host,
-			pubsub.WithDirectConnectTicks(1),
-			pubsub.WithDirectPeers(indexerAddrinfo),
-		)
-		pubT, err := pubG.Join(topic)
+		s.Node.IndexProvider, err = s.newIndexProvider()
 		if err != nil {
 			return err
 		}
-
-		s.Node.IndexProvider, err = engine.New(
-			engine.WithTopic(pubT),      // TODO: remove, testing
-			engine.WithTopicName(topic), // TODO: remove, testing
-			// engine.WithHost(h),
-			engine.WithHost(s.Node.Host), // need to be localhost/estuary
-			engine.WithPublisherKind(engine.DataTransferPublisher),
-			// we need these addresses to be here instead
-			// of on the p2p host h because if we add them
-			// as ListenAddrs it'll try to start listening locally
-			// engine.WithRetrievalAddrs(addrs...),
-		)
-		if err != nil {
-			return err
-		}
-
 		s.Node.IndexProvider.Start(context.Background())
 		defer s.Node.IndexProvider.Shutdown()
 
