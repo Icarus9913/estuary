@@ -89,6 +89,8 @@ require (
 	gorm.io/gorm v1.21.15
 )
 
+require github.com/libp2p/go-libp2p-pubsub v0.6.1
+
 require (
 	github.com/BurntSushi/toml v0.4.1 // indirect
 	github.com/DataDog/zstd v1.4.1 // indirect
@@ -255,7 +257,6 @@ require (
 	github.com/libp2p/go-libp2p-noise v0.3.0 // indirect
 	github.com/libp2p/go-libp2p-peerstore v0.6.0 // indirect
 	github.com/libp2p/go-libp2p-pnet v0.2.0 // indirect
-	github.com/libp2p/go-libp2p-pubsub v0.6.1 // indirect
 	github.com/libp2p/go-libp2p-quic-transport v0.16.1 // indirect
 	github.com/libp2p/go-libp2p-swarm v0.10.2 // indirect
 	github.com/libp2p/go-libp2p-tls v0.3.1 // indirect

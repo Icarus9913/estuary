@@ -28,6 +28,7 @@ import (
 	"github.com/ipfs/go-datastore"
 	gsimpl "github.com/ipfs/go-graphsync/impl"
 	logging "github.com/ipfs/go-log/v2"
+	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
@@ -180,20 +181,52 @@ func (m *estuaryMhIterator) Next() (multihash.Multihash, error) {
 	return nil, io.EOF
 }
 
-func buildAdvertisement(h host.Host, mhIterator provider.MultihashIterator, ar Autoretrieve) (schema.Advertisement, error) {
-	// build contextID for advertisement
-	// format: "EstuaryAd-" + ID of autoretrieve server
+// createFakeAutoretrieveHost builds a libp2p host object with the
+// private key of the autoretrieve server so we can send advertisements
+// on behalf of those servers (as if we were them)
+// Note: this is a hack, we should create tokens that give partial
+// permissions to other players
+func createFakeAutoretrieveHost(ar Autoretrieve) (host.Host, error) {
 	arPrivKey, err := stringToPrivkey(ar.PrivateKey)
 	if err != nil {
-		return schema.Advertisement{}, err
+		return nil, err
+	}
+
+	h, err := libp2p.New(libp2p.Identity(arPrivKey))
+	if err != nil {
+		return nil, err
+	}
+
+	return h, nil
+}
+
+// getAutoretrieveContextID builds the contextID for a give autoretrieve server
+// format: "EstuaryAd-" + ID of autoretrieve server
+func getAutoretrieveContextID(ar Autoretrieve) ([]byte, error) {
+	arPrivKey, err := stringToPrivkey(ar.PrivateKey)
+	if err != nil {
+		return nil, err
 	}
 
 	arID, err := peer.IDFromPrivateKey(arPrivKey)
 	if err != nil {
-		return schema.Advertisement{}, err
+		return nil, err
 	}
 	strArID := arID.String()
 	contextID := []byte("EstuaryAd-" + strArID)
+
+	return contextID, nil
+}
+
+// buildAdvertisement constructs a schema.Advertisement{} struct
+// containing the information from Autoretrieve as well as Estuary
+func (s *Server) buildAdvertisement(mhIterator provider.MultihashIterator, ar Autoretrieve) (schema.Advertisement, error) {
+	// build contextID for advertisement
+	// format: "EstuaryAd-" + ID of autoretrieve server
+	contextID, err := getAutoretrieveContextID(ar)
+	if err != nil {
+		return schema.Advertisement{}, err
+	}
 
 	md := metadata.New(metadata.Bitswap{})
 	mdBytes, err := md.MarshalBinary()
@@ -204,7 +237,7 @@ func buildAdvertisement(h host.Host, mhIterator provider.MultihashIterator, ar A
 	//TODO: these values are completely arbitrary
 	chunkSize := 1000
 	capacity := 1000
-	entriesChuncker, err := chunker.NewCachedEntriesChunker(context.Background(), datastore.NewMapDatastore(), chunkSize, capacity)
+	entriesChuncker, err := chunker.NewCachedEntriesChunker(context.Background(), s.Node.Datastore, chunkSize, capacity)
 	if err != nil {
 		return schema.Advertisement{}, err
 	}
@@ -214,19 +247,25 @@ func buildAdvertisement(h host.Host, mhIterator provider.MultihashIterator, ar A
 		return schema.Advertisement{}, err
 	}
 
-	splitAddresses := strings.Split(ar.Addresses, ",")
+	h := s.Node.Host
+	// h, err := createFakeAutoretrieveHost(ar)
+	// if err != nil {
+	// 	return schema.Advertisement{}, err
+	// }
+
+	// splitAutoretrieveAddresses := strings.Split(ar.Addresses, ",")
 	ad := schema.Advertisement{
-		Provider: h.ID().String(), // provider is the estuary p2p host
-		// Addresses: multiAddrsToString(h.Addrs()),
-		Addresses: splitAddresses, // addresses are the autoretrieve ones
+		Provider:  h.ID().String(), // provider is the estuary p2p host
+		Addresses: multiAddrsToString(h.Addrs()),
+		// Addresses: splitAutoretrieveAddresses, // addresses are the autoretrieve ones
 		Entries:   entries,
 		ContextID: contextID,
 		Metadata:  mdBytes,
 	}
 
-	// Sign the advertisement using autoretrieve's private key
-	estuaryPrivKey := h.Peerstore().PrivKey(h.ID())
-	if err := ad.Sign(estuaryPrivKey); err != nil {
+	// Sign the advertisement using the provider's private key
+	hostPrivkey := h.Peerstore().PrivKey(h.ID())
+	if err := ad.Sign(hostPrivkey); err != nil {
 		return schema.Advertisement{}, err
 	}
 
@@ -254,7 +293,7 @@ func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 	e.RegisterMultihashLister(func(ctx context.Context, contextID []byte) (provider.MultihashIterator, error) {
 		return mhIterator, nil
 	})
-	ad, err := buildAdvertisement(s.Node.Host, mhIterator, ar)
+	ad, err := s.buildAdvertisement(mhIterator, ar)
 	if err != nil {
 		return err
 	}
@@ -272,7 +311,7 @@ func (s *Server) announceNewCIDs(newContents []Content, ar Autoretrieve) error {
 // newIndexProvider creates a new index-provider engine to send announcements to storetheindex
 // this needs to keep running continuously because storetheindex
 // will come to fetch advertisements "when it feels like it"
-func newIndexProvider(host host.Host) (*engine.Engine, error) {
+func newIndexProvider(host host.Host, ds datastore.Batching) (*engine.Engine, error) {
 	// TODO: remove s *Server, remove topic, indexerMultiaddr, etc.
 	topic := "/indexer/ingest/mainnet"
 	indexerMultiaddr, err := multiaddr.NewMultiaddr("/ip4/127.0.0.1/tcp/3003/p2p/12D3KooWCD4L8AEXAcPJg6PwosKU9ZWfC2ZisrrsYBvBgrwSBNXw")
@@ -296,6 +335,7 @@ func newIndexProvider(host host.Host) (*engine.Engine, error) {
 	}
 
 	newEngine, err := engine.New(
+		engine.WithDatastore(ds),
 		engine.WithTopic(pubT),      // TODO: remove, testing
 		engine.WithTopicName(topic), // TODO: remove, testing
 		// engine.WithHost(h),
@@ -710,7 +750,8 @@ func main() {
 		// Create index-provider engine (s.Node.IndexProvider) to send announcements to
 		// this needs to keep running continuously because storetheindex
 		// will come to fetch for advertisements "when it feels like it"
-		s.Node.IndexProvider, err = newIndexProvider(s.Node.Host)
+
+		s.Node.IndexProvider, err = newIndexProvider(s.Node.Host, s.Node.Datastore)
 		s.Node.IndexProvider.Start(context.Background())
 		defer s.Node.IndexProvider.Shutdown()
 		if err != nil {
